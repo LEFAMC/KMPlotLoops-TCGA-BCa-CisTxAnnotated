@@ -1,0 +1,392 @@
+---
+title: "KM plot mega loop - Annotated data"
+author: "Lily Feldman; adapted from Cailin Deiter"
+date: "2023-05-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Survival plots for genes of interest in TCGA data
+
+###Data input and formatting
+```{r}
+library(ggplot2)
+library(survival)
+library(survminer)
+library(tidyverse)
+library(RColorBrewer)
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("qvalue")
+
+######## Using pre-annotated data from Jim/Andrew - Costello Lab ########
+
+# read in platinum treatment annotations from Jim/Andrew
+path2file_ann <- "/Users/feldmali/Desktop/Data/TCGA_BLCA_Parsed_Cis_Unrecorded.txt"
+tcga.meta.blca.ann <- as.data.frame(readr::read_tsv(file= path2file_ann, col_names = T, trim_ws = T))
+row.names(tcga.meta.blca.ann) <- tcga.meta.blca.ann$ID # a data frame with patients as rows and clinical obs as columns
+
+#### read in gene expression data from TCGA Firehouse study
+path2file_dat <- "/Users/feldmali/Desktop/Data/blca_tcga/data_mrna_seq_v2_rsem.txt"
+tcga.gexp.blca <- as.data.frame(readr::read_tsv(file= path2file_dat, col_names = T, trim_ws = T))
+
+#### format and clean up the gene expression data
+n_occur <- data.frame(table(tcga.gexp.blca$Hugo_Symbol))        ##which genes are duplicated?
+n_occur[n_occur$Freq > 1,]
+dups <- tcga.gexp.blca[tcga.gexp.blca$Hugo_Symbol %in% n_occur$Var1[n_occur$Freq > 1],]
+tcga.gexp.blca.uniq <-tcga.gexp.blca                            ## convert the dataframe to a data.table
+data.table::setDT(tcga.gexp.blca.uniq)                          ## create data table (DT is way faster than DF for some reason?)
+tcga.gexp.blca.uniq <- tcga.gexp.blca.uniq[order(Hugo_Symbol)]  ## sort  dataframe by the Hugo_symbol column
+tcga.gexp.blca.uniq <- tcga.gexp.blca.uniq[, lapply(.SD, median, na.rm = TRUE), by = Hugo_Symbol] ## combine duplicated rows by taking the median value of each patient's expression for that gene
+
+anyNA(tcga.gexp.blca.uniq$Hugo_Symbol)                          ## why are there empty hugo values? which rows?
+empties <- tcga.gexp.blca.uniq[is.na(tcga.gexp.blca.uniq$Hugo_Symbol),] ## remove them
+tcga.gexp.blca.uniq <- tcga.gexp.blca.uniq[!is.na(tcga.gexp.blca.uniq$Hugo_Symbol),]
+tcga.gexp.blca.uniq <- as.data.frame(tcga.gexp.blca.uniq)
+
+row.names(tcga.gexp.blca.uniq) <- tcga.gexp.blca.uniq$Hugo_Symbol ## assign hugo symbols as rownames
+tcga.gexp.blca.uniq <- tcga.gexp.blca.uniq %>% dplyr::select(-"Hugo_Symbol", -"Entrez_Gene_Id") ## remove entrez and hugo ID cols
+tcga.gexp.blca.uniq <- as.data.frame(tcga.gexp.blca.uniq) ##convert back into dataframe
+rm(empties, dups, n_occur)  ## declutter
+
+colnames(tcga.gexp.blca.uniq) <- gsub("-01","",colnames(tcga.gexp.blca.uniq)) ##clean up gene expression data patient IDs
+
+rn.uniq <- as.matrix(row.names(tcga.gexp.blca.uniq))
+```
+
+
+###Defining input variables and stratifying on Cisplatin vs Unrecorded Treatment
+``` {r}
+# define input variables
+dat <- tcga.gexp.blca.uniq      # data frame w/ patients as columns, genes as rows
+
+clin <- tcga.meta.blca.ann[colnames(tcga.gexp.blca.uniq),] %>% 
+  select("OS.time", "OS","Cisplatin","Unrecorded")    # patients as rows, meta data as columns
+
+# create a column with OS time in months (not days)
+os.month <- clin$OS.time
+os.month <- os.month/30
+clin$OS.months <- os.month
+
+# create a single column with Treatment info (Cisplatin or Unrecorded)
+clin$Cisplatin <- as.numeric(gsub("1","2", clin$Cisplatin))
+clin$Treatment <- rowSums(clin[,3:4])
+clin$Treatment <- gsub("1","Unrecorded", clin$Treatment)
+clin$Treatment <- gsub("2","Cisplatin", clin$Treatment)
+
+# stratify into two datasets by cisplatin vs unrecorded treatment
+clin.cis <- clin %>% filter(Treatment=="Cisplatin")
+clin.unrec <- clin %>% filter(Treatment=="Unrecorded")
+sum(clin.cis$Unrecorded) # spot check - should be 0
+sum(clin.unrec$Cisplatin) # spot check - should be 0
+
+
+# create the output matrix for q-values (added 9-19-2023)
+  q <- matrix(data = NA, nrow = 32, ncol = 5)
+  colnames(q) <- c("Gene", "pval.med.os.cis", "pval.qtile.os.cis", "pval.med.os.unrec", "pval.qtile.os.unrec")
+  rownames(q) <- genes
+```
+
+###create survival objects and plot for each of Cis and Unrec groups
+``` {r}
+# define output file names
+cancertype <- "BlCa"                                              # for output file name
+dataset <- "TCGA"                                                 # for output file name
+method <- "RNA-seq V2 RSEM"                                       # for output file name
+filename <- "NPEPPS-PPI-PtTxAnnotation_CPH_qval"                       # for output file name - changed to avoid overwrite
+med.pal <- brewer.pal(name = "PuRd", n=9)[c(4,2)]                 # color palette for median-stratified surv curvs
+qtile.pal <- brewer.pal(name="BuPu", n=9)[c(2,4,6,8)]             # color palette for quantile-stratified surv curvs
+
+genes <- c("LRRC8A","LRRC8C","LRRC8E","LRRC8D","LRRC8B", "ATP5L", "VDAC2", "SFXN3", "SLC1A5", "SLC25A13", "SLC25A24", "MRPL17", "MRPS33", "RPL27A", "RPLP1", "EXOSC10", "SMN1", "DDX47", "HELZ2", "AKAP8L", "JUNB", "FOXA2", "NKRF", "DM2", "CNBP", "XIAP", "CCT6A", "ABP125", "TNRC6C", "SH3BP4", "YARS2", "TRNAU1AP","CNOT2")
+
+#ATP5MG = ATP5L
+#CNBP = DM2
+#SEC31A = ABP125
+
+# remove genes that are not present in gene expression data
+genes <- genes[genes %in% row.names(dat)]
+
+# make plots!
+path2save <- "/Users/feldmali/Desktop/"
+pdf(file = paste0(path2save, "KMplots_", cancertype, "_", dataset, "_", filename, ".pdf"), width = 16, height = 12)
+
+########## data wrangling and median/quantile annotations  ############# 
+
+###### CISPLATIN #####
+
+for(i in genes){
+
+    gene <- i 
+    
+    # prep input df
+    dat.subset.cis <- dat[gene,] %>% na.omit() %>% t() %>% as.data.frame()
+
+# merge w/ clinical data
+    dat.subset.cis <- merge(dat.subset.cis, clin.cis, by = 0)
+    row.names(dat.subset.cis) <- dat.subset.cis$Row.names
+    dat.subset.cis <- dat.subset.cis %>% select(-c("Row.names"))
+    
+    # annotate patients as above/below median expression
+    med <- median(as.numeric(dat.subset.cis[,gene]))
+    med.above <- row.names(dat.subset.cis)[which(dat.subset.cis[,gene] > med)]
+    med.below <- row.names(dat.subset.cis)[which(dat.subset.cis[,gene] <= med)]
+    
+    # annotate median
+    dat.subset.cis <- dat.subset.cis %>% mutate(group = case_when(
+      row.names(dat.subset.cis) %in% med.above ~ paste0(gene, "_high"),
+      row.names(dat.subset.cis) %in% med.below ~ paste0(gene, "_low")
+      ))
+    
+    # annotate patients by quantiles of expression
+    qtiles <- quantile(as.numeric(dat.subset.cis[,gene]))
+    q1 <- row.names(dat.subset.cis)[dat.subset.cis[,gene] <= qtiles[[2]]]
+    q2 <- row.names(dat.subset.cis)[qtiles[[2]] <= dat.subset.cis[,gene] & dat.subset.cis[,gene] <= qtiles[[3]]]
+    q3 <- row.names(dat.subset.cis)[qtiles[[3]] <= dat.subset.cis[,gene] & dat.subset.cis[,gene] <= qtiles[[4]]]
+    q4 <- row.names(dat.subset.cis)[qtiles[[4]] <= dat.subset.cis[,gene] & dat.subset.cis[,gene] <= qtiles[[5]]]
+    
+    dat.subset.cis <- dat.subset.cis %>% mutate(qtiles = case_when(
+      row.names(dat.subset.cis) %in% q1 ~ paste0("q1=",paste0(round(qtiles[[1]],2)), "-", paste0(round(qtiles[[2]],2)), "_", gene),
+      row.names(dat.subset.cis) %in% q2 ~ paste0("q2=",paste0(round(qtiles[[2]],2)), "-", paste0(round(qtiles[[3]],2)), "_", gene),
+      row.names(dat.subset.cis) %in% q3 ~ paste0("q3=",paste0(round(qtiles[[3]],2)), "-", paste0(round(qtiles[[4]],2)), "_", gene),
+      row.names(dat.subset.cis) %in% q4 ~ paste0("q4=",paste0(round(qtiles[[4]],2)), "-", paste0(round(qtiles[[5]],2)), "_", gene)
+                                                          ))
+    
+    # factor the mess so ggplot doesn't plot it in a weird order
+     dat.subset.cis$qtiles <- factor(dat.subset.cis$qtiles, 
+                                    levels = c(paste0("q1=",paste0(round(qtiles[[1]],2)), "-", paste0(round(qtiles[[2]],2)), "_", gene),
+                                               paste0("q2=",paste0(round(qtiles[[2]],2)), "-", paste0(round(qtiles[[3]],2)), "_", gene),
+                                               paste0("q3=",paste0(round(qtiles[[3]],2)), "-", paste0(round(qtiles[[4]],2)), "_", gene),
+                                               paste0("q4=",paste0(round(qtiles[[4]],2)), "-", paste0(round(qtiles[[5]],2)), "_", gene)
+                                               ))
+    
+     ########## survival analysis  #############
+    
+    # create survival object w/ time and censor flags
+    surv.obj.os.cis <- Surv(time = dat.subset.cis$OS.month, event = dat.subset.cis$OS) 
+
+     # calculate Cox Proportional Hazard score
+     cph.cis <- summary(coxph(surv.obj.os.cis ~ dat.subset.cis$group))
+     
+    # quick survplot - fit surv curv
+    sft.med.os.cis <- survfit(surv.obj.os.cis ~ dat.subset.cis$group)
+        names(sft.med.os.cis$strata) <- gsub("group=", "", names(sft.med.os.cis$strata))
+    sft.qtile.os.cis <- survfit(surv.obj.os.cis ~ dat.subset.cis$qtiles)
+        names(sft.qtile.os.cis$strata) <- gsub("qtiles=", "", names(sft.qtile.os.cis$strata))
+ 
+    # log rank test
+    sd.med.os.cis <- survdiff(surv.obj.os.cis ~ dat.subset.cis$group)
+    sd.qtile.os.cis <- survdiff(surv.obj.os.cis ~ dat.subset.cis$qtiles)
+     
+    # calculate q-value (adj.p-value)
+    pval.med.os.cis = round(pchisq(sd.med.os.cis$chisq, df=1, lower.tail=F),3)
+    #qval.med.os.cis = round(qchisq(pval.med.os.cis, df=1, lower.tail = F), 3)
+    pval.qtile.os.cis = round(pchisq(sd.qtile.os.cis$chisq, df=3, lower.tail=F),3)
+    #qval.qtile.os.cis = round(qchisq(pval.qtile.os.cis, df=1, lower.tail=F),3)
+
+########## plot by OS #############    
+    ggsurv.med.os.cis <- ggsurvplot(sft.med.os.cis,
+                         data = dat.subset.cis,
+                         fun = "pct",
+                         palette = med.pal,
+                         submain = as.character(paste("OS based on", gene, "expression", "Cisplatin", "(", dataset, ")")),
+                         font.submain = c(16, "bold", "black"),
+                         caption = "*high/low = above/below median",
+                         font.caption = c(11, "plain", "black"),
+                         xlab = "Time (months)",
+                         font.x = c(14, "bold.italic", "black"),
+                         xlim = c(0,120),
+                         ylab = "Survival (%)",
+                         font.y = c(14, "bold.italic", "black"),
+                         font.tickslab = c(12, "plain", "black"),
+                         base_size = 14,
+                         ggtheme = theme_classic(),
+                         risk.table = T, 
+                         risk.table.title = "",
+                         risk.table.y.text.col = T,
+                         risk.table.y.text = F,
+                         break.time.by = 24,
+                         pval = T,
+                         surv.median.line = "hv",
+                         legend = "right"
+    )
+    
+    ggsurv.qtile.os.cis <- ggsurvplot(sft.qtile.os.cis,
+                         data = dat.subset.cis,
+                         fun = "pct",
+                         palette = qtile.pal,
+                         submain = as.character(paste("OS based on", gene, "expression", "Cisplatin", "(", dataset, ")")),
+                         font.submain = c(16, "bold", "black"),
+                         font.caption = c(11, "plain", "black"),
+                         xlab = "Time (months)",
+                         font.x = c(14, "bold.italic", "black"),
+                         xlim = c(0,120),
+                         ylab = "Survival (%)",
+                         font.y = c(14, "bold.italic", "black"),
+                         font.tickslab = c(12, "plain", "black"),
+                         base_size = 14,
+                         ggtheme = theme_classic(),
+                         risk.table = T, 
+                         risk.table.title = "",
+                         risk.table.y.text.col = T,
+                         risk.table.y.text = F,
+                         break.time.by = 24,
+                         pval = T,
+                         surv.median.line = "hv",
+                         legend = "right"
+    )
+    
+     ###### UNRECORDED #####
+
+# prep input df
+    dat.subset.unrec <- dat[gene,] %>% na.omit() %>% t() %>% as.data.frame()
+
+# merge w/ clinical data
+    dat.subset.unrec <- merge(dat.subset.unrec, clin.unrec, by = 0)
+    row.names(dat.subset.unrec) <- dat.subset.unrec$Row.names
+    dat.subset.unrec <- dat.subset.unrec %>% select(-c("Row.names"))
+    
+# annotate patients as above/below median expression
+    med <- median(as.numeric(dat.subset.unrec[,gene]))
+    med.above <- row.names(dat.subset.unrec)[which(dat.subset.unrec[,gene] > med)]
+    med.below <- row.names(dat.subset.unrec)[which(dat.subset.unrec[,gene] <= med)]
+    
+# annotate median
+    dat.subset.unrec <- dat.subset.unrec %>% mutate(group = case_when(
+      row.names(dat.subset.unrec) %in% med.above ~ paste0(gene, "_high"),
+      row.names(dat.subset.unrec) %in% med.below ~ paste0(gene, "_low")
+      ))
+    
+# annotate patients by quantiles of expression
+    qtiles <- quantile(as.numeric(dat.subset.unrec[,gene]))
+    q1 <- row.names(dat.subset.unrec)[dat.subset.unrec[,gene] <= qtiles[[2]]]
+    q2 <- row.names(dat.subset.unrec)[qtiles[[2]] <= dat.subset.unrec[,gene] & dat.subset.unrec[,gene] <= qtiles[[3]]]
+    q3 <- row.names(dat.subset.unrec)[qtiles[[3]] <= dat.subset.unrec[,gene] & dat.subset.unrec[,gene] <= qtiles[[4]]]
+    q4 <- row.names(dat.subset.unrec)[qtiles[[4]] <= dat.subset.unrec[,gene] & dat.subset.unrec[,gene] <= qtiles[[5]]]
+    
+    dat.subset.unrec <- dat.subset.unrec %>% mutate(qtiles = case_when(
+      row.names(dat.subset.unrec) %in% q1 ~ paste0("q1=",paste0(round(qtiles[[1]],2)), "-", paste0(round(qtiles[[2]],2)), "_", gene),
+      row.names(dat.subset.unrec) %in% q2 ~ paste0("q2=",paste0(round(qtiles[[2]],2)), "-", paste0(round(qtiles[[3]],2)), "_", gene),
+      row.names(dat.subset.unrec) %in% q3 ~ paste0("q3=",paste0(round(qtiles[[3]],2)), "-", paste0(round(qtiles[[4]],2)), "_", gene),
+      row.names(dat.subset.unrec) %in% q4 ~ paste0("q4=",paste0(round(qtiles[[4]],2)), "-", paste0(round(qtiles[[5]],2)), "_", gene)
+                                                          ))
+    
+# factor the mess so ggplot doesn't plot it in a weird order
+     dat.subset.unrec$qtiles <- factor(dat.subset.unrec$qtiles, 
+                                    levels = c(paste0("q1=",paste0(round(qtiles[[1]],2)), "-", paste0(round(qtiles[[2]],2)), "_", gene),
+                                               paste0("q2=",paste0(round(qtiles[[2]],2)), "-", paste0(round(qtiles[[3]],2)), "_", gene),
+                                               paste0("q3=",paste0(round(qtiles[[3]],2)), "-", paste0(round(qtiles[[4]],2)), "_", gene),
+                                               paste0("q4=",paste0(round(qtiles[[4]],2)), "-", paste0(round(qtiles[[5]],2)), "_", gene)
+                                               ))
+    
+########## survival analysis  #############
+    
+# create survival object w/ time and censor flags
+    surv.obj.os.unrec <- Surv(time = dat.subset.unrec$OS.month, event = dat.subset.unrec$OS)
+     
+# calculate Cox Proportional Hazard score
+     #note: http://www.sthda.com/english/wiki/cox-proportional-hazards-model helpful!
+     cph.unrec <- summary(coxph(surv.obj.os.unrec ~ dat.subset.unrec$group))
+     
+# quick survplot - fit surv curv
+    sft.med.os.unrec <- survfit(surv.obj.os.unrec ~ dat.subset.unrec$group)
+        names(sft.med.os.unrec$strata) <- gsub("group=", "", names(sft.med.os.unrec$strata))
+    sft.qtile.os.unrec <- survfit(surv.obj.os.unrec ~ dat.subset.unrec$qtiles)
+        names(sft.qtile.os.unrec$strata) <- gsub("qtiles=", "", names(sft.qtile.os.unrec$strata))
+ 
+# log rank test
+    sd.med.os.unrec <- survdiff(surv.obj.os.unrec ~ dat.subset.unrec$group)
+    sd.qtile.os.unrec <- survdiff(surv.obj.os.unrec ~ dat.subset.unrec$qtiles)
+
+# calculate q-value (adj.p-value)
+    pval.med.os.unrec = round(pchisq(sd.med.os.unrec$chisq, df=1, lower.tail=F),3)
+    #qval.med.os.unrec = round(qchisq(pval.med.os.unrec, df=1, lower.tail = F), 3)
+    pval.qtile.os.unrec = round(pchisq(sd.qtile.os.unrec$chisq, df=3, lower.tail=F),3)
+    #qval.qtile.os.unrec = round(qchisq(pval.qtile.os.unrec, df=1, lower.tail=F),3)
+   
+########## plot by OS #############
+    
+    ggsurv.med.os.unrec <- ggsurvplot(sft.med.os.unrec,
+                         data = dat.subset.unrec,
+                         fun = "pct",
+                         palette = med.pal,
+                         submain = as.character(paste("OS based on", gene, "expression", "Unrecorded", "(", dataset, ")")),
+                         font.submain = c(16, "bold", "black"),
+                         caption = "*high/low = above/below median",
+                         font.caption = c(11, "plain", "black"),
+                         xlab = "Time (months)",
+                         font.x = c(14, "bold.italic", "black"),
+                         xlim = c(0,120),
+                         ylab = "Survival (%)",
+                         font.y = c(14, "bold.italic", "black"),
+                         font.tickslab = c(12, "plain", "black"),
+                         base_size = 14,
+                         ggtheme = theme_classic(),
+                         risk.table = T, 
+                         risk.table.title = "",
+                         risk.table.y.text.col = T,
+                         risk.table.y.text = F,
+                         break.time.by = 24,
+                         pval = T,
+                         surv.median.line = "hv",
+                         legend = "right"
+    )
+    
+        ggsurv.qtile.os.unrec <- ggsurvplot(sft.qtile.os.unrec,
+                         data = dat.subset.unrec,
+                         fun = "pct",
+                         palette = qtile.pal,
+                         submain = as.character(paste("OS based on", gene, "expression", "Unrecorded", "(", dataset, ")")),
+                         font.submain = c(16, "bold", "black"),
+                         font.caption = c(11, "plain", "black"),
+                         xlab = "Time (months)",
+                         font.x = c(14, "bold.italic", "black"),
+                         xlim = c(0,120),
+                         ylab = "Survival (%)",
+                         font.y = c(14, "bold.italic", "black"),
+                         font.tickslab = c(12, "plain", "black"),
+                         base_size = 14,
+                         ggtheme = theme_classic(),
+                         risk.table = T, 
+                         risk.table.title = "",
+                         risk.table.y.text.col = T,
+                         risk.table.y.text = F,
+                         break.time.by = 24,
+                         pval = T,
+                         surv.median.line = "hv",
+                         legend = "right"
+    )
+
+########## arrange plots and print! #############  
+        
+  p <- list(ggsurv.med.os.cis, ggsurv.qtile.os.cis, ggsurv.med.os.unrec, ggsurv.qtile.os.unrec)
+  p <- arrange_ggsurvplots(p, print = F, nrow = 2, ncol = 2, padding = 10)
+  
+  s <- list(cph.cis, cph.unrec)
+  
+  q[gene,1] <- gene
+  q[gene,2] <- pval.med.os.cis
+  q[gene,3] <- pval.qtile.os.cis
+  q[gene,4] <- pval.med.os.unrec
+  q[gene,5] <- pval.qtile.os.unrec
+  
+    print(p)
+    #print(s)
+    #print(q)
+}
+dev.off()
+
+# calculate adjusted p-values from the p-values generated above (stored in q)
+p.adj <- matrix(data = NA, nrow = 32, ncol = 5)
+colnames(p.adj) <- c("Gene", "padj.med.os.cis", "padj.qtile.os.cis", "padj.med.os.unrec", "padj.qtile.os.unrec")
+  rownames(p.adj) <- genes
+p.adj[,1] <- genes
+p.adj[,2] <- round(p.adjust(q[,2], method = c("BH")),3)
+p.adj[,3] <- round(p.adjust(q[,3], method = c("BH")),3)
+p.adj[,4] <- round(p.adjust(q[,4], method = c("BH")),3)
+p.adj[,5] <- round(p.adjust(q[,5], method = c("BH")),3)
+```

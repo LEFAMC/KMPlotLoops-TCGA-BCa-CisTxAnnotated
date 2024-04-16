@@ -1,0 +1,403 @@
+---
+title: "KM p-val/q-val mega loop - Annotated data with copy number alteration"
+author: "Lily Feldman; adapted from Cailin Deiter"
+date: "2023-10-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Survival plots for genes of interest in TCGA data
+
+###Data input and formatting (updated 10-7-23)
+```{r}
+#load packages
+library(survival)
+library(survminer)
+library(tidyverse)
+library(RColorBrewer)
+library("scales")
+show_col(pal_npg("nrc")(10))
+
+#color palettes for plotting
+cna.pal <- c("#c12f21", "#fdae96", "#4f0e5e")
+qtile.pal <- brewer.pal(name="BuPu", n=9)[c(2,4,6,8)]             # color palette for quantile-stratified surv curvs
+
+######## Using pre-annotated data from Jim/Andrew - Costello Lab ########
+
+# read in platinum treatment annotations from Jim/Andrew
+filepath_ann <- "/Users/feldmali/Desktop/Data/TCGA_BLCA_Parsed_Cis_Unrecorded.txt"
+tcga.meta.blca.ann <- as.data.frame(readr::read_tsv(file= filepath_ann, col_names = T, trim_ws = T))
+row.names(tcga.meta.blca.ann) <- tcga.meta.blca.ann$ID # a data frame with patients as rows and clinical obs as columns
+
+#### read in CNA data from TCGA Firehouse study (downloaded from cbioportal)
+path2file_CNA <- "/Users/feldmali/Desktop/Data/blca_tcga/data_cna.txt"
+tcga.CNA.blca <- as.data.frame(readr::read_tsv(file= path2file_CNA, col_names = T, trim_ws = T))
+
+#### format and clean up the gene expression data
+n_occur <- data.frame(table(tcga.CNA.blca$Hugo_Symbol))        ##which genes are duplicated?
+n_occur[n_occur$Freq > 1,]
+dups <- tcga.CNA.blca[tcga.CNA.blca$Hugo_Symbol %in% n_occur$Var1[n_occur$Freq > 1],]
+tcga.CNA.blca.uniq <-tcga.CNA.blca                            ## convert the dataframe to a data.table
+data.table::setDT(tcga.CNA.blca.uniq)                          ## create data table (DT is way faster than DF for some reason?)
+tcga.CNA.blca.uniq <- tcga.CNA.blca.uniq[order(Hugo_Symbol)]  ## sort  dataframe by the Hugo_symbol column
+tcga.CNA.blca.uniq <- tcga.CNA.blca.uniq[, lapply(.SD, median, na.rm = TRUE), by = Hugo_Symbol] ## combine duplicated rows by taking the median value of each patient's expression for that gene
+
+anyNA(tcga.CNA.blca.uniq$Hugo_Symbol)                          ## why are there empty hugo values? which rows?
+empties <- tcga.CNA.blca.uniq[is.na(tcga.CNA.blca.uniq$Hugo_Symbol),] ## remove them
+tcga.CNA.blca.uniq <- tcga.CNA.blca.uniq[!is.na(tcga.CNA.blca.uniq$Hugo_Symbol),]
+tcga.CNA.blca.uniq <- as.data.frame(tcga.CNA.blca.uniq)
+
+row.names(tcga.CNA.blca.uniq) <- tcga.CNA.blca.uniq$Hugo_Symbol ## assign hugo symbols as rownames
+
+tcga.CNA.blca.uniq <- tcga.CNA.blca.uniq %>% dplyr::select(-"Hugo_Symbol", -"Entrez_Gene_Id") ## remove entrez and hugo ID cols
+tcga.CNA.blca.uniq <- as.data.frame(tcga.CNA.blca.uniq) ##convert back into dataframe
+rm(empties, dups, n_occur)  ## declutter
+
+colnames(tcga.CNA.blca.uniq) <- gsub("-01","",colnames(tcga.CNA.blca.uniq)) ##clean up gene expression data patient IDs
+
+rn.uniq <- as.matrix(row.names(tcga.CNA.blca.uniq))
+```
+
+
+###Defining input variables and stratifying on Cisplatin vs Unrecorded Treatment (updated 10-7-23)
+``` {r}
+# define input variables
+dat <- tcga.CNA.blca.uniq      # data frame w/ patients as columns, genes as rows: 20513 genes, 408 pts
+
+clin <- tcga.meta.blca.ann[colnames(tcga.gexp.blca.uniq),] %>% 
+  select("OS.time", "OS","Cisplatin","Unrecorded")   # patients as rows, meta data as columns
+
+# create a column with OS time in months (not days)
+os.month <- clin$OS.time
+os.month <- os.month/30
+clin$OS.months <- os.month
+
+# create a single column with Treatment info (Cisplatin or Unrecorded)
+clin$Cisplatin <- as.numeric(gsub("1","2", clin$Cisplatin))
+clin$Treatment <- rowSums(clin[,3:4])
+clin$Treatment <- gsub("1","Unrecorded", clin$Treatment)
+clin$Treatment <- gsub("2","Cisplatin", clin$Treatment)
+
+# stratify into two datasets by cisplatin vs unrecorded treatment
+clin.cis <- clin %>% filter(Treatment=="Cisplatin")
+clin.unrec <- clin %>% filter(Treatment=="Unrecorded")
+sum(clin.cis$Unrecorded) # spot check - should be 0
+sum(clin.cis$Cisplatin)
+sum(clin.unrec$Cisplatin) # spot check - should be 0
+sum(clin.unrec$Unrecorded)
+
+# create the output matrix for p-values
+  p <- matrix(data = NA, nrow = length(genes), ncol = 3)
+  colnames(p) <- c("Gene", "Cisplatin_CNA_Pvals", "Unrecorded_CNA_Pvals")
+  rownames(p) <- genes
+  
+  
+# define output file name for plots
+cancertype <- "BlCa"                                              # for output file name
+dataset <- "TCGA"                                                 # for output file name
+method <- "CNA"                                       # for output file name
+pvalfilename <- "PtTxAnnotation_Pvals"                # for output file name - changed to avoid overwrite
+path2save <- "/Users/feldmali/Desktop/"                         # where to save the output file
+
+# define output file name for hazard ratios
+cancertype <- "BlCa"                                              # for output file name
+dataset <- "TCGA"                                                 # for output file name
+method <- "CNA"                                       # for output file name
+cphfilename <- "PtTxAnnotation_CoxPropHazards"                # for output file name - changed to avoid overwrite
+path2save <- "/Users/feldmali/Desktop/"                         # where to save the output file
+
+# create df to store genes, p values and hazard ratios
+ranked.genes <- data.frame(row.names = genes)
+ranked.genes$'group' <- ""
+ranked.genes$'hazardratio' <- ""
+ranked.genes$'pval' <- ""
+ranked.genes$'survdiff=highExpr-lowExpr' <- ""
+
+```
+
+
+###create survival objects and calculate P-values for each of Cis and Unrec groups (updated 10-7-23)
+``` {r}
+########## data wrangling and median/quantile annotations  ############# 
+
+# create list of genes to stratify on: NPEPPS top 32 interactors
+genes <- c("NPEPPS", "LRRC8A", "LRRC8C", "LRRC8E", "LRRC8D", "LRRC8B", "ATP5L", "VDAC2", "SFXN3", "SLC1A5", "SLC25A13", "SLC25A24", "MRPL17", "MRPS33", "RPL27A", "RPLP1", "EXOSC10", "SMN1", "DDX47", "HELZ2", "AKAP8L", "JUNB", "FOXA2", "NKRF", "CNBP", "XIAP", "CCT6A", "SEC31A", "TNRC6C", "SH3BP4", "YARS2", "TRNAU1AP", "CNOT2")
+#ATP5MG = ATP5L
+
+# make plots!
+path2save <- "/Users/feldmali/Desktop/"
+pdf(file = paste0(path2save, "KMplots_", cancertype, "_", dataset, "_", filename, ".pdf"), width = 16, height = 12)
+
+###### CISPLATIN #####
+
+for(i in genes){
+  
+    gene <- "CCT6A"
+    
+    # prep input df
+    dat.subset.cis <- dat[gene,] %>% na.omit() %>% t() %>% as.data.frame()
+
+# merge w/ clinical data
+    dat.subset.cis <- merge(dat.subset.cis, clin.cis, by = 0)
+    row.names(dat.subset.cis) <- dat.subset.cis$Row.names
+    dat.subset.cis <- dat.subset.cis %>% select(-c("Row.names"))
+    
+    # annotate patients as gain/loss based on CNA (1:2 = gain; -1:-2 = loss)
+    nochange <- row.names(dat.subset.cis)[which(dat.subset.cis[,gene] == 0)]
+    gain <- row.names(dat.subset.cis)[which(dat.subset.cis[,gene] > 0)]
+    loss <- row.names(dat.subset.cis)[which(dat.subset.cis[,gene] < 0)]
+    
+    # annotate gain/loss
+    dat.subset.cis <- dat.subset.cis %>% mutate(group = case_when(
+      row.names(dat.subset.cis) %in% gain ~ paste0(gene, "_gain"),
+      row.names(dat.subset.cis) %in% loss ~ paste0(gene, "_loss"),
+      row.names(dat.subset.cis) %in% nochange ~ paste0(gene, "_nochange")
+      ))
+    
+    
+
+     ########## survival analysis  #############
+    
+    # create survival object w/ time and censor flags
+    surv.obj.os.cis <- Surv(time = dat.subset.cis$OS.month, event = dat.subset.cis$OS) 
+
+    # calculate Cox Proportional Hazard score
+     cph.cis <- summary(coxph(surv.obj.os.cis ~ dat.subset.cis$group))
+
+    
+    # log rank test for survival difference
+    sd.cna.os.cis <- survdiff(surv.obj.os.cis ~ dat.subset.cis$group)
+     
+    # calculate p-value
+    pval.cna.os.cis = pchisq(sd.cna.os.cis$chisq, df=2, lower.tail=F)
+    
+    # quick survplot - fit surv curv
+    sft.cna.os.cis <- survfit(surv.obj.os.cis ~ dat.subset.cis$group)
+        names(sft.cna.os.cis$strata) <- gsub("group=", "", names(sft.cna.os.cis$strata))
+   
+########## plot by OS #############    
+    ggsurv.cna.os.cis <- ggsurvplot(sft.cna.os.cis,
+                         data = dat.subset.cis,
+                         fun = "pct",
+                         palette = cna.pal,
+                         submain = as.character(paste("Platinum Treatment Survival", ":", gene, "Copy Number", "(TCGA)")),
+                         font.submain = c(16, "bold", "black"),
+                         caption = "gain/loss = amplification/deletion",
+                         font.caption = c(11, "plain", "black"),
+                         xlab = "Time (months)",
+                         font.x = c(14, "bold.italic", "black"),
+                         xlim = c(0,120),
+                         ylab = "Survival (%)",
+                         font.y = c(14, "bold.italic", "black"),
+                         font.tickslab = c(12, "plain", "black"),
+                         base_size = 14,
+                         ggtheme = theme_classic(),
+                         risk.table = T, 
+                         risk.table.title = "",
+                         risk.table.y.text.col = T,
+                         risk.table.y.text = F,
+                         break.time.by = 24,
+                         pval = T,
+                         surv.median.line = "hv",
+                         legend = "right"
+    )
+
+    
+     ###### UNRECORDED #####
+
+# prep input df
+    dat.subset.unrec <- dat[gene,] %>% na.omit() %>% t() %>% as.data.frame()
+
+# merge w/ clinical data
+    dat.subset.unrec <- merge(dat.subset.unrec, clin.unrec, by = 0)
+    row.names(dat.subset.unrec) <- dat.subset.unrec$Row.names
+    dat.subset.unrec <- dat.subset.unrec %>% select(-c("Row.names"))
+    
+# annotate patients as gain/loss based on CNA (1:2 = gain; -1:-2 = loss)
+    nochange <- row.names(dat.subset.unrec)[which(dat.subset.unrec[,gene] == 0)]
+    gain <- row.names(dat.subset.unrec)[which(dat.subset.unrec[,gene] > 0)]
+    loss <- row.names(dat.subset.unrec)[which(dat.subset.unrec[,gene] < 0)]
+    
+    
+# annotate gain/loss
+    dat.subset.unrec <- dat.subset.unrec %>% mutate(group = case_when(
+      row.names(dat.subset.unrec) %in% gain ~ paste0(gene, "_gain"),
+      row.names(dat.subset.unrec) %in% loss ~ paste0(gene, "_loss"),
+      row.names(dat.subset.unrec) %in% nochange ~ paste0(gene, "_nochange")
+      ))
+    
+    
+########## survival analysis  #############
+    
+# create survival object w/ time and censor flags
+    surv.obj.os.unrec <- Surv(time = dat.subset.unrec$OS.month, event = dat.subset.unrec$OS)
+     
+# calculate Cox Proportional Hazard score
+     #note: http://www.sthda.com/english/wiki/cox-proportional-hazards-model helpful!
+     cph.unrec <- summary(coxph(surv.obj.os.unrec ~ dat.subset.unrec$group))
+     
+# log rank test
+    sd.cna.os.unrec <- survdiff(surv.obj.os.unrec ~ dat.subset.unrec$group)
+
+# calculate p-value
+    pval.cna.os.unrec = pchisq(sd.cna.os.unrec$chisq, df=3, lower.tail=F)
+    
+# quick survplot - fit surv curv
+sft.cna.os.unrec <- survfit(surv.obj.os.unrec ~ dat.subset.unrec$group)
+        names(sft.cna.os.unrec$strata) <- gsub("group=", "", names(sft.cna.os.unrec$strata))
+   
+        
+########## plot by OS #############    
+    ggsurv.cna.os.unrec <- ggsurvplot(sft.cna.os.unrec,
+                         data = dat.subset.unrec,
+                         fun = "pct",
+                         palette = cna.pal,
+                         submain = as.character(paste("Unrecorded Treatment Survival", ":", gene, "Copy Number", "(TCGA)")),
+                         font.submain = c(16, "bold", "black"),
+                         caption = "gain/loss = amplification/deletion",
+                         font.caption = c(11, "plain", "black"),
+                         xlab = "Time (months)",
+                         font.x = c(14, "bold.italic", "black"),
+                         xlim = c(0,120),
+                         ylab = "Survival (%)",
+                         font.y = c(14, "bold.italic", "black"),
+                         font.tickslab = c(12, "plain", "black"),
+                         base_size = 14,
+                         ggtheme = theme_classic(),
+                         risk.table = T, 
+                         risk.table.title = "",
+                         risk.table.y.text.col = T,
+                         risk.table.y.text = F,
+                         break.time.by = 24,
+                         pval = T,
+                         surv.median.line = "hv",
+                         legend = "right"
+    )
+
+########## arrange plots and print! #############  
+        
+  plots <- list(ggsurv.cna.os.cis, ggsurv.cna.os.unrec)
+  plots <- arrange_ggsurvplots(plots, print = F, nrow = 2, ncol = 2, padding = 10)
+  
+  p[gene,1] <- gene
+  p[gene,2] <- pval.cna.os.cis
+  p[gene,3] <- pval.cna.os.unrec
+  
+ s <- list(cph.cis$coefficients, cph.unrec$coefficients)
+ print(s)
+
+  print(plots)
+}
+
+write.csv(p, file = "/Users/feldmali/Desktop/KM_CNA_Pval_PlatinumAnnotations.csv", row.names = TRUE, col.names = TRUE)
+
+
+
+dev.off()
+
+
+```
+
+Hazard ratio of genes stratified by CNA predicting OVERALL survival using TCGA MIBC data.
+```{r}
+
+
+for(i in genes){
+
+########## data wrangling and median/quantile annotations  #############  
+    gene <- i
+     
+   
+    # annotate patients as above/below median expression
+    med <- median(as.numeric(dat[gene,]))
+    med.above <- colnames(dat)[which(dat[gene,] > med)]
+    med.below <- colnames(dat)[which(dat[gene,] <= med)]
+    
+    # prep input df
+    dat.subset <- dat[gene,] %>% na.omit() %>% t() %>% as.data.frame()
+    
+    # annotate median
+    dat.subset <- dat.subset %>% mutate(group = case_when(
+      row.names(dat.subset) %in% med.above ~ paste0(gene, "_zhigh"),
+      row.names(dat.subset) %in% med.below ~ paste0(gene, "_low")
+      ))     
+    
+    # merge w/ clinical data
+    dat.subset <- merge(dat.subset, clin, by = 0)
+    row.names(dat.subset) <- dat.subset$Row.names
+    dat.subset <- dat.subset %>% select(-"Row.names")
+
+    # survival analyses
+    cph <- coxph(Surv(OS_MONTHS, as.numeric(substr(OS_STATUS, 1, 1))) ~ group, data = dat.subset)
+    
+    ## which group is the hazard ratio calcuated for (high or low expression)
+    g <- row.names(summary(cph)$coefficients) 
+    
+    ## hazard ratio
+    hr <- summary(cph)$coefficients[2]
+    
+    ## p-value
+    pv <- summary(cph)$coefficients[5]   
+    
+    ## fit surv curv to get median survival difference (sd)
+    sft <- survfit(Surv(time = dat.subset$OS_MONTHS, event = dat.subset$OS_STATUS) ~ dat.subset$group)      
+    medsurv.hi <- survminer::surv_median(sft)[which(endsWith(names(sft$strata), "high")),"median"]
+    medsurv.lo <- survminer::surv_median(sft)[which(endsWith(names(sft$strata), "low")),"median"]
+    sd <- medsurv.hi - medsurv.lo
+    
+    # append to df to store results
+    ranked.genes[gene,"group"] <- g
+    ranked.genes[gene,"hr"] <- as.numeric(hr)
+    ranked.genes[gene,"pv"] <- as.numeric(pv)
+    ranked.genes[gene,"survdiff=highExpr-lowExpr"] <- as.numeric(sd)
+
+}
+
+# make rownames (gene names) into a  column so that they are included in the saved tsv file
+ranked.genes <- rownames_to_column(ranked.genes, var = "Symbol")
+row.names(ranked.genes) <- ranked.genes$Symbol
+
+# convert back to numeric
+ranked.genes$hr <- as.numeric(ranked.genes$hr)
+ranked.genes$pv <- as.numeric(ranked.genes$pv)
+ranked.genes$`survdiff=highExpr-lowExpr` <- as.numeric(ranked.genes$`survdiff=highExpr-lowExpr`)
+
+# sort by hazard ratio
+sorted2save <- ranked.genes[order(ranked.genes$hr, decreasing = T),]
+
+# save!
+write_tsv(sorted2save, file = paste0(path2save, "coxph_HRranked_genes_", cancertype, "_", dataset, "_stratBy", strat, "_", filename, ".tsv", colnames = T)
+
+```
+
+
+``` {r}
+
+##################### TO DO 9/21/2023 #########################
+
+# calculate adjusted p-values from the p-values generated above (stored in q)
+
+#create matrix for p.adj values
+p.adj <- matrix(data = NA, nrow = length(genes), ncol = 5)
+colnames(p.adj) <- c("Gene", "padj.med.os.cis", "padj.qtile.os.cis", "padj.med.os.unrec", "padj.qtile.os.unrec")
+rownames(p.adj) <- genes
+
+p.adj[,1] <- genes
+
+for (j in 2:5) {
+  p.adj[,j] <- round(p.adjust(q[,j], 
+                              method = c("FDR"), 
+                              n = length(genes)),3)
+}
+
+# sort by Cis qtile pvals
+p.adj_sorted2save <- as.data.frame(p.adj[order(p.adj[,3], decreasing = T),])
+
+#Save please! :)
+
+write_tsv(p.adj_sorted2save, file = paste0(path2save, "SurvDiffFDR_BHadj_chisqpval_allgenes_", cancertype, "_", dataset, "_", filename, ".tsv"))
+
+```
